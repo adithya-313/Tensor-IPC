@@ -1,4 +1,7 @@
 services:
+  # ---------------------------------------------------------------------------
+  # Worker A — Shared-Memory Writer
+  # ---------------------------------------------------------------------------
   worker_a:
     build: ./worker_a
     container_name: tensoripc-writer
@@ -25,7 +28,13 @@ services:
       interval: 1s
       retries: 5
       start_period: 2s
+    # Attach to the custom bridge network so the Gateway can route to us.
+    networks:
+      - tensor_net
 
+  # ---------------------------------------------------------------------------
+  # Worker B — Shared-Memory Reader
+  # ---------------------------------------------------------------------------
   worker_b:
     build: ./worker_b
     container_name: tensoripc-reader
@@ -50,3 +59,39 @@ services:
     depends_on:
       worker_a:
         condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Gateway — Multi-Stage Distroless Reverse Proxy (Go)
+  # ---------------------------------------------------------------------------
+  gateway:
+    build: ./gateway
+    container_name: tensoripc-gateway
+    # Expose port 8000 to the host so external clients can reach the API.
+    # The gateway listens inside the container on 8000 and proxies requests
+    # to worker_a:8080 over the internal ``tensor_net`` bridge network.
+    ports:
+      - "8000:8000"
+    # Resource limits — keep the gateway lean so Worker A gets most of the CPU.
+    # cpus: '0.5'  — at most half a core.
+    # mem_limit: '128M' — hard cap at 128 MB of RAM.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "128M"
+    # Attach to the same custom bridge network as Worker A so the reverse
+    # proxy can resolve ``http://worker_a:8080`` via Docker's built-in DNS.
+    networks:
+      - tensor_net
+    depends_on:
+      - worker_a
+
+# ---------------------------------------------------------------------------
+# Custom bridge network
+# ---------------------------------------------------------------------------
+# A user-defined bridge network gives us automatic DNS resolution between
+# containers (e.g. the gateway can resolve "worker_a" to Worker A's IP).
+# The default bridge does NOT support DNS-based service discovery.
+networks:
+  tensor_net:
+    driver: bridge
