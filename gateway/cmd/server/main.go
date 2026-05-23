@@ -52,7 +52,9 @@ const listenAddr = ":8000"
 // rateLimitTokens is the maximum number of requests that can be in-flight
 // concurrently.  This is a simple token-bucket: each incoming request
 // "takes" a token and releases it when done.
-const rateLimitTokens = 10
+// Increased from 10 to 100 for the Phase 3 k6 benchmark (50 VUs).
+// In production, tune this value to match Worker A's capacity.
+const rateLimitTokens = 100
 
 // readTimeoutSeconds is the maximum time we wait to *read* the entire
 // request from a client (including the body).  Prevents slow-loris attacks.

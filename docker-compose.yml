@@ -86,6 +86,35 @@ services:
     depends_on:
       - worker_a
 
+  # ---------------------------------------------------------------------------
+  # k6 — Load Generator
+  # ---------------------------------------------------------------------------
+  k6:
+    # grafana/k6 is the official Docker image for the k6 load-testing tool.
+    # It executes the JavaScript test script and reports metrics (RPS,
+    # percentiles, failure rate) to stdout.
+    image: grafana/k6:latest
+    container_name: tensoripc-k6
+    # Mount the local ``load_test/`` directory so the container can find our
+    # ``script.js`` test definition.
+    volumes:
+      - ./load_test:/load_test
+    # The command that k6 runs inside the container.
+    # ``run`` tells k6 to execute a script; ``/load_test/script.js`` is the
+    # test file we just mounted.
+    command: run /load_test/script.js
+    # Attach to the same bridge network so k6 can resolve ``gateway:8000``
+    # and ``worker_a:8080`` via Docker DNS.
+    networks:
+      - tensor_net
+    # k6 must start *after* the gateway and Worker A are fully up, otherwise
+    # every request would fail with "connection refused".
+    depends_on:
+      gateway:
+        condition: service_started
+      worker_a:
+        condition: service_started
+
 # ---------------------------------------------------------------------------
 # Custom bridge network
 # ---------------------------------------------------------------------------

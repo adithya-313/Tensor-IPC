@@ -1,2 +1,5 @@
-# No external dependencies needed — we use only stdlib.
-# multiprocessing.shared_memory ships with Python >= 3.8.
+# External dependencies for the HTTP-to-IPC bridge.
+# fastapi   — Modern Python web framework for building the control-plane HTTP server.
+# uvicorn   — ASGI server that runs FastAPI; binds to 0.0.0.0:8080.
+fastapi
+uvicorn
