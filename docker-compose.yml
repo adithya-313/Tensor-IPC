@@ -52,10 +52,17 @@ services:
     # Writer pinned to 0-1, the two processes will never fight over an L1
     # or L2 cache line, giving us a clean micro-benchmark environment.
     cpuset: "2,3"
+    # Explicit command override (matches the Dockerfile ENTRYPOINT).
+    # Using the ``command`` key in docker-compose makes the entrypoint
+    # visible at the infrastructure layer for operators.
+    command: ["python", "-m", "domain.reader"]
+    # restart: always — Guarantees the daemon respawns if it crashes or is
+    # killed.  Combined with the SIGTERM handler in reader.py, a ``docker
+    # stop`` triggers a graceful shutdown rather than a SIGKILL.
+    restart: always
     # Worker B should start only after Worker A is confirmed "healthy"
     # (i.e. its process is running inside the container).  This ensures
     # the target IPC namespace actually exists when Docker tries to join.
-    restart: on-failure:3
     depends_on:
       worker_a:
         condition: service_healthy

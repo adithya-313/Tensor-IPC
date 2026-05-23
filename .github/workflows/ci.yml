@@ -1,0 +1,65 @@
+# ============================================================================
+# TensorIPC — CI/CD Pipeline
+#
+# Triggered on every push and pull-request to the ``main`` branch.
+#
+# What it does:
+#   1. Checks out the code.
+#   2. Installs Docker Compose v2 (included in GitHub's ubuntu-latest runner).
+#   3. Makes the validation script executable.
+#   4. Runs the full Phase 3 self-validation loop (build, health check,
+#      k6 load test, log inspection).
+#
+# If any step fails, the workflow fails and the PR is blocked.
+# ============================================================================
+
+name: TensorIPC CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # --------------------------------------------------------------------------
+  # build-and-test
+  # --------------------------------------------------------------------------
+  build-and-test:
+    # The "ubuntu-latest" runner includes Docker, Docker Compose v2, and
+    # all necessary tools out of the box.  No extra provisioning needed.
+    runs-on: ubuntu-latest
+
+    # Timeout prevents runaway jobs from burning CI minutes.
+    timeout-minutes: 15
+
+    steps:
+      # Step 1 — Download the repository contents.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2 — Verify Docker is available (should be on ubuntu-latest).
+      - name: Verify Docker
+        run: docker version --format '{{.Server.Version}}'
+
+      # Step 3 — Make the validation script executable.
+      # The ``validate_phase3.sh`` script was authored on Windows which
+      # does not preserve the executable bit.  We set it explicitly here.
+      - name: Make validation script executable
+        run: chmod +x validate_phase3.sh
+
+      # Step 4 — Run the complete validation pipeline.
+      # This builds the Docker images, starts the stack, runs the k6 load
+      # test, inspects logs, and tears everything down.
+      - name: Run self-validation loop
+        run: ./validate_phase3.sh
+
+      # Step 5 (informational) — Print final container logs if the
+      # validation succeeded, so developers can inspect them in the CI UI.
+      - name: Print gateway logs
+        if: success()
+        run: docker logs tensoripc-gateway 2>&1 || true
+
+      - name: Print worker_a logs (last 10 lines)
+        if: success()
+        run: docker logs tensoripc-writer 2>&1 | tail -10 || true

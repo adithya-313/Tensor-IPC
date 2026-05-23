@@ -79,6 +79,12 @@ class TensorResponse(BaseModel):
 _shm: shared_memory.SharedMemory | None = None
 """Module-global handle to the persistent shared-memory segment."""
 
+_write_counter: int = 0
+"""Monotonically increasing counter included in the first 4 bytes of every
+write so the Reader's state-tracking can detect each update.  Without this
+the data would be identical on every POST /tensor and the daemon would only
+log the first change."""
+
 
 # ---------------------------------------------------------------------------
 # Core domain function
@@ -127,9 +133,21 @@ def _write_tensor(name: str, size: int) -> dict:
 
     # --- Step 2: Write data into the segment ---------------------------------
     try:
-        data: bytearray = bytearray(range(size))
+        global _write_counter
+        _write_counter += 1
+
+        # The first 4 bytes encode a monotonically increasing write counter
+        # (little-endian) so the Reader's state-tracking mechanism can
+        # detect every update.  Without this, the data would be identical
+        # on every POST /tensor and the daemon would only log once.
+        # The remaining 60 bytes carry the standard 0..59 pattern.
+        data: bytearray = bytearray(size)
+        data[0:4] = _write_counter.to_bytes(4, "little")
+        for i in range(4, size):
+            data[i] = (i - 4) % 256
+
         _shm.buf[:size] = data
-        _log.info("Wrote %d bytes: %s", size, list(data))
+        _log.info("Wrote %d bytes (write #%d): first 4 bytes = %s", size, _write_counter, list(data[:4]))
         return {"status": "success", "shm_name": name, "bytes_written": size}
     except Exception as exc:
         _log.exception("Failed to write to shared memory: %s", exc)
