@@ -1,0 +1,2 @@
+# No external dependencies needed — we use only stdlib.
+# multiprocessing.shared_memory ships with Python >= 3.8.

@@ -1,0 +1,52 @@
+services:
+  worker_a:
+    build: ./worker_a
+    container_name: tensoripc-writer
+    # ipc: "shareable" — This flag tells Docker to give this container a
+    # dedicated IPC (Inter-Process Communication) namespace AND explicitly
+    # allows other containers to share it.  Inside Linux, features like
+    # System V semaphores, POSIX message queues, and (crucially for us)
+    # /dev/shm (shared memory) live in this namespace.  By making it
+    # "shareable" we let Worker B attach to the same /dev/shm region.
+    ipc: "shareable"
+    # cpuset: "0,1" — Pin this container to physical CPU cores 0 and 1.
+    # This guarantees deterministic CPU affinity for the writer process,
+    # which is important when measuring low-level tensor throughput.
+    cpuset: "0,1"
+    # shm_size: '256m' — Expand /dev/shm from the tiny 64 MB default to
+    # 256 MB so we have room for realistic tensor buffers without hitting
+    # "Cannot allocate memory" errors from SharedMemory(create=True).
+    shm_size: "256m"
+    # healthcheck — A trivial command that passes as soon as the container
+    # is running.  This lets worker_b use ``condition: service_healthy``
+    # so it never tries to join the IPC namespace before worker_a is ready.
+    healthcheck:
+      test: ["CMD", "echo", "alive"]
+      interval: 1s
+      retries: 5
+      start_period: 2s
+
+  worker_b:
+    build: ./worker_b
+    container_name: tensoripc-reader
+    # ipc: "container:worker_a" — Attach Worker B's IPC namespace to the
+    # one already owned by Worker A.  This means any shared memory segment
+    # created by Worker A (via multiprocessing.shared_memory) appears at
+    # the same path in Worker B's /dev/shm, so the reader can open it
+    # by name without any network round-trip.
+    # NOTE: The value after "container:" must match worker_a's
+    # ``container_name`` above (tensoripc-writer), NOT the Compose
+    # service name (worker_a).  Docker resolves this at runtime by
+    # looking for a running container with that exact name.
+    ipc: "container:tensoripc-writer"
+    # cpuset: "2,3" — Pin Worker B to cores 2 and 3.  Combined with the
+    # Writer pinned to 0-1, the two processes will never fight over an L1
+    # or L2 cache line, giving us a clean micro-benchmark environment.
+    cpuset: "2,3"
+    # Worker B should start only after Worker A is confirmed "healthy"
+    # (i.e. its process is running inside the container).  This ensures
+    # the target IPC namespace actually exists when Docker tries to join.
+    restart: on-failure:3
+    depends_on:
+      worker_a:
+        condition: service_healthy
