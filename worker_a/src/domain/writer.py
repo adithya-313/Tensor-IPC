@@ -21,6 +21,7 @@ Resilience design
 from __future__ import annotations
 
 import logging
+import struct
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -38,7 +39,14 @@ SHM_NAME: Final[str] = "tensor_data"
 """Well-known POSIX shared-memory segment name (must match the Reader)."""
 
 TENSOR_BYTE_COUNT: Final[int] = 64
-"""Number of bytes written into shared memory per ``POST /tensor`` request."""
+"""Total number of bytes written into shared memory per ``POST /tensor``
+request.  The first ``SEQ_OFFSET`` bytes (4) are the Seqlock header; the
+remaining ``TENSOR_BYTE_COUNT - SEQ_OFFSET`` bytes carry the payload."""
+
+SEQ_OFFSET: Final[int] = 4
+"""Number of bytes reserved for the Seqlock 32-bit sequence number at the
+start of the shared-memory segment.  An even value means "data is consistent".
+An odd value means "write in progress — reader must retry"."""
 
 HOST: Final[str] = "0.0.0.0"
 """Bind address — listen on all interfaces so the Gateway can reach us via
@@ -79,11 +87,14 @@ class TensorResponse(BaseModel):
 _shm: shared_memory.SharedMemory | None = None
 """Module-global handle to the persistent shared-memory segment."""
 
-_write_counter: int = 0
-"""Monotonically increasing counter included in the first 4 bytes of every
-write so the Reader's state-tracking can detect each update.  Without this
-the data would be identical on every POST /tensor and the daemon would only
-log the first change."""
+_sequence: int = 0
+"""Seqlock sequence number stored in the kernel page.  The Writer:
+  1. Reads the current even value from ``_shm.buf[0:4]``.
+  2. Stores ``current + 1`` (odd — write in progress).
+  3. Writes payload bytes into ``[SEQ_OFFSET:]``.
+  4. Stores ``current + 2`` (even — consistent).
+The Reader validates by comparing the sequence *before* and *after* reading:
+if they match and are even, the snapshot is torn-read free."""
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +103,24 @@ log the first change."""
 
 def _write_tensor(name: str, size: int) -> dict:
     """
-    Create (or overwrite) a named shared-memory segment and fill it with a
-    deterministic byte pattern (0, 1, 2, …, size-1).
+    Create (or overwrite) a named shared-memory segment using the **Seqlock**
+    protocol to guarantee that the Reader never observes a torn write.
 
-    If the segment already exists (from a previous request), we simply
-    overwrite its contents — no need to unlink and re-create.
+    The first ``SEQ_OFFSET`` (4) bytes are the 32-bit seqlock sequence:
+      - Even = "data is consistent" (safe to read).
+      - Odd  = "write in progress" (reader must retry).
+    Payload data occupies ``[SEQ_OFFSET:size]``.
 
     Parameters
     ----------
     name : str
         POSIX shared-memory segment name.
     size : int
-        Number of bytes to write.
+        Total number of bytes for the segment (seqlock header + payload).
 
     Returns
     -------
     dict
-        A dictionary suitable for JSON serialisation:
         ``{"status": ..., "shm_name": ..., "bytes_written": ...}``
     """
     global _shm  # we are modifying the module-level reference
@@ -131,23 +143,45 @@ def _write_tensor(name: str, size: int) -> dict:
     else:
         _log.info("Reusing existing segment '%s'.", name)
 
-    # --- Step 2: Write data into the segment ---------------------------------
+    # --- Step 2: Write data into the segment (Seqlock protocol) --------------
     try:
-        global _write_counter
-        _write_counter += 1
+        global _sequence
 
-        # The first 4 bytes encode a monotonically increasing write counter
-        # (little-endian) so the Reader's state-tracking mechanism can
-        # detect every update.  Without this, the data would be identical
-        # on every POST /tensor and the daemon would only log once.
-        # The remaining 60 bytes carry the standard 0..59 pattern.
+        # Build the payload bytearray.  We skip the first SEQ_OFFSET bytes
+        # (reserved for the seqlock) and fill the rest with a deterministic
+        # pattern: 0, 1, 2, …, (size - SEQ_OFFSET - 1) modulo 256.
+        # Example: at size=64, offset=4, bytes 4..63 get values 0..59.
         data: bytearray = bytearray(size)
-        data[0:4] = _write_counter.to_bytes(4, "little")
-        for i in range(4, size):
-            data[i] = (i - 4) % 256
+        for i in range(SEQ_OFFSET, size):
+            data[i] = (i - SEQ_OFFSET) % 256
 
-        _shm.buf[:size] = data
-        _log.info("Wrote %d bytes (write #%d): first 4 bytes = %s", size, _write_counter, list(data[:4]))
+        # ── Seqlock write protocol (3 sub-steps) ──────────────────────────
+
+        # (a) Read the current sequence from shared memory.  On the very
+        #     first write the segment is zeroed, so ``current_seq`` = 0
+        #     (even — consistent, but no data yet).
+        current_seq: int = struct.unpack_from("<I", _shm.buf, 0)[0]
+
+        # (b) Compute ODD = current + 1, write it into buf[0:4].
+        #     An odd seqlock tells the Reader "write in progress" — any
+        #     reader that observes an odd value will spin-retry.
+        odd_seq: int = current_seq + 1
+        struct.pack_into("<I", _shm.buf, 0, odd_seq)
+        _log.info("Seqlock → %d (odd — write in progress).", odd_seq)
+
+        # (c) Write the payload bytes into the data region.
+        #     The seqlock is still odd, so the Reader will NOT attempt
+        #     to read the payload during this window.
+        _shm.buf[SEQ_OFFSET:size] = data[SEQ_OFFSET:size]
+
+        # (d) Compute EVEN = odd + 1, write it into buf[0:4].
+        #     An even seqlock signals "data is consistent".  The Reader
+        #     can now safely read the payload without risk of a torn read.
+        even_seq: int = odd_seq + 1
+        struct.pack_into("<I", _shm.buf, 0, even_seq)
+        _log.info("Seqlock → %d (even — consistent), %d payload bytes written.", even_seq, size - SEQ_OFFSET)
+
+        _sequence = even_seq
         return {"status": "success", "shm_name": name, "bytes_written": size}
     except Exception as exc:
         _log.exception("Failed to write to shared memory: %s", exc)

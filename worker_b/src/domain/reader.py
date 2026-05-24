@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import struct
 import sys
 import time
 from multiprocessing import shared_memory
@@ -61,6 +62,16 @@ POLL_INTERVAL_SEC: Final[float] = 0.01
 """10 ms sleep between polls — fast enough to catch every write under load
 (50 VUs × 10 s produces ~5000 writes) but slow enough to keep CPU usage near
 zero when idle."""
+
+SEQ_OFFSET: Final[int] = 4
+"""Must match ``writer.SEQ_OFFSET``.  Bytes ``[0:SEQ_OFFSET]`` hold the
+Seqlock 32-bit sequence number; payload data starts at ``[SEQ_OFFSET:]``."""
+
+MAX_SEQLOCK_RETRIES: Final[int] = 100
+"""Maximum spin iterations when the Seqlock indicates a concurrent write.
+100 retries × ~100 µs sleep = 10 ms worst-case wait before giving up.
+This is far shorter than our 10 ms poll interval, so it never delays the
+next poll cycle."""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -99,6 +110,67 @@ def _handle_signal(signum: int, _frame) -> None:  # type: ignore[type-arg]
 # when the process receives SIGTERM from ``docker stop`` or ``kill``.
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+
+
+# ---------------------------------------------------------------------------
+# Seqlock helper: torn-read-free snapshot
+# ---------------------------------------------------------------------------
+
+def _read_consistent(shm: shared_memory.SharedMemory, size: int) -> bytes | None:
+    """
+    Read the full shared-memory buffer using the Seqlock protocol.
+
+    Spins (with a 100 µs micro-sleep between attempts) until the seqlock
+    sequence is *even* and *unchanged* before and after the read.
+
+    Parameters
+    ----------
+    shm : shared_memory.SharedMemory
+        Attached shared-memory handle.
+    size : int
+        Number of bytes to read (typically ``EXPECTED_BYTE_COUNT``).
+
+    Returns
+    -------
+    bytes | None
+        A consistent snapshot of the buffer, or ``None`` if the seqlock
+        never stabilised within ``MAX_SEQLOCK_RETRIES`` attempts.
+    """
+    for attempt in range(1, MAX_SEQLOCK_RETRIES + 1):
+        # Step 1 — Record the seqlock sequence BEFORE touching the payload.
+        #          We unpack 4 bytes as a little-endian unsigned integer.
+        sequence_before: int = struct.unpack_from("<I", shm.buf, 0)[0]
+
+        # Step 2 — If the sequence is ODD, the Writer is in the middle of a
+        #          write cycle.  Spin-wait with a tiny sleep so we don't peg
+        #          the CPU, then retry from the top.
+        if sequence_before % 2 != 0:
+            time.sleep(0.0001)  # 100 microseconds
+            continue
+
+        # Step 3 — Read the entire segment (seqlock header + payload) into a
+        #          local ``bytes`` object.  This creates a point-in-time
+        #          snapshot that we can compare against the sequence AFTER.
+        snapshot: bytes = bytes(shm.buf[:size])
+
+        # Step 4 — Record the seqlock sequence AFTER the read finished.
+        sequence_after: int = struct.unpack_from("<I", shm.buf, 0)[0]
+
+        # Step 5 — If the sequence CHANGED during our read, the Writer
+        #          completed a write while we were copying.  Our snapshot
+        #          might contain bytes from both the old and new payload,
+        #          so we discard it and retry.
+        if sequence_before != sequence_after:
+            time.sleep(0.0001)  # 100 microseconds
+            continue
+
+        # Step 6 — Sequence is even AND unchanged.  The snapshot is
+        #          guaranteed to be consistent — the Writer did not touch
+        #          the payload while we were reading.
+        return snapshot
+
+    _log.error("Seqlock did not stabilise after %d retries.  Returning None.", MAX_SEQLOCK_RETRIES)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +240,31 @@ def read_tensor_continuous(name: str, expected_size: int) -> None:
 
     try:
         while _running:
-            # Read the current contents of the shared buffer.
-            # ``shm.buf[:expected_size]`` returns a ``memoryview`` slice;
-            # we convert to ``bytes`` so we can compare and hash easily.
-            current_data: bytes = bytes(shm.buf[:expected_size])
+            # Use the Seqlock protocol to read a torn-read-free snapshot
+            # of the shared-memory buffer.  This replaces the raw
+            # ``bytes(shm.buf[:expected_size])`` call which had no
+            # protection against reading a half-written payload.
+            # If the seqlock never stabilises (Writer is too fast), we
+            # skip this poll cycle and try again on the next one.
+            current_data: bytes | None = _read_consistent(shm, expected_size)
+            if current_data is None:
+                _log.warning("Seqlock read failed — skipping poll cycle.")
+                poll_count += 1
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
-            # State-tracking: compare with the last known snapshot.
+            # State-tracking: compare the consistent snapshot with the
+            # last known state.  The snapshot includes the seqlock header
+            # (bytes 0-3), so every successful write produces a unique
+            # sequence number and therefore a unique snapshot — no write
+            # is missed.
             if current_data != last_state:
                 changes_detected += 1
                 _log.info(
-                    "NEW DATA #%d — %d bytes: %s",
-                    changes_detected, len(current_data), list(current_data),
+                    "NEW DATA #%d — %d bytes (seq=%d): %s",
+                    changes_detected, len(current_data),
+                    struct.unpack_from("<I", current_data, 0)[0],
+                    list(current_data),
                 )
                 last_state = current_data
 
